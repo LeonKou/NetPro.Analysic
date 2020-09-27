@@ -20,7 +20,7 @@
 			},
 			{
 				"Enabled": true,
-				"Path": "/api/sdk/v2/accounts/action/register/account", //注册账号
+				"Path": "/api/test/add", 
 				"MaxSucceedLimit": 100,
 				"MaxErrorLimit": 50
 			}
