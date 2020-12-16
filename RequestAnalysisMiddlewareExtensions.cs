@@ -8,9 +8,11 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Net;
 using System.Text;
 using System.Text.Json;
 using System.Threading.Tasks;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace NetPro.Analysic
 {
@@ -23,7 +25,9 @@ namespace NetPro.Analysic
         private readonly RequestAnalysisOption _requestAnalysisOption;
         private readonly RequestDelegate _next;
         private readonly IMemoryCache _memorycache;
+#pragma warning disable CS0618 // Type or member is obsolete
         private readonly IRedisManager _redisManager;
+#pragma warning restore CS0618 // Type or member is obsolete
         private readonly RedisCacheOption _redisCacheOption;
         private readonly IHttpContextAccessor _httpContextAccessor;
 
@@ -41,7 +45,9 @@ namespace NetPro.Analysic
             ILogger<RequestAnalysisMiddleware> iLogger,
             RequestAnalysisOption requestAnalysisOption,
             IMemoryCache memorycache,
+#pragma warning disable CS0618 // Type or member is obsolete
             IRedisManager redisManager,
+#pragma warning restore CS0618 // Type or member is obsolete
             RedisCacheOption redisCacheOption,
             IHttpContextAccessor httpContextAccessor)
         {
@@ -68,6 +74,7 @@ namespace NetPro.Analysic
             });
 
             var analysisConfigListTemp = _requestAnalysisOption.PolicyOption;
+            _iLogger.LogDebug($"流量分析获取的请求路径:{context.Request.Path.Value}"); //TODO 支持包含{id}此类路径
             var analysisConfigTemp = analysisConfigListTemp?.Where(s => s.Enabled == true && s.Path.Equals(context.Request.Path.Value, StringComparison.OrdinalIgnoreCase))?.FirstOrDefault();
 
             int maxLimitTemp = 0;
@@ -102,12 +109,12 @@ namespace NetPro.Analysic
                 if (context.Response.StatusCode == 200)
                 {
                     string keySucceed = $"{RedisKeys.Key_Request_Limit_IP_Succ}{currentIp}";
-                    RecordRequest($"{keySucceed}{path}", CheckIpValidResultByConfig.Item2);
+                    RecordRequest(keySucceed: $"{keySucceed}{path}", hitDuration: analysisConfigTemp.HitDuration);
                 }
                 else
                 {
                     string keyError = $"{RedisKeys.Key_Request_Limit_IP_Error}{currentIp}";
-                    RecordRequest(keyError: $"{keyError}{path}", limitByIpError: CheckIpValidResultByConfig.Item3);
+                    RecordRequest(keyError: $"{keyError}{path}", hitDuration: analysisConfigTemp.HitDuration);
                 }
 
                 await Task.CompletedTask;
@@ -122,7 +129,7 @@ namespace NetPro.Analysic
             if (!context?.Response.HasStarted ?? false)
             {
                 _iLogger.LogWarning($"[HighRiskIP]IP高危：{GetRequestIp()} 请求警告");
-                context.Response.StatusCode = 400;
+                context.Response.StatusCode = (int)HttpStatusCode.Conflict;
                 context.Response.ContentType = "application/json";
                 context.Response.Headers["WARNING"] = "NetPro.Analysic";
 
@@ -151,7 +158,7 @@ namespace NetPro.Analysic
             //同ip请求次数限制
             //同用户请求次数限制
             //TODO 同IP 每小时关联的用户数
-            //TODO 同IP每小时关联的UUID数
+            //TODO 同IP每小时关联的UUID数             
             var currentIp = GetRequestIp();
             int limitByIp = 0;
             int limitByIpError = 0;
@@ -165,9 +172,6 @@ namespace NetPro.Analysic
 
             limitByIp = _redisManager.Get<int>(keySucceed);
 
-            if (maxLimit > 0 && limitByIp > maxLimit)
-                return Tuple.Create<bool, int, int>(false, limitByIp, limitByIpError);
-
             //校验失败请求次数
             string keyError = $"{RedisKeys.Key_Request_Limit_IP_Error}{currentIp}";
             if (!string.IsNullOrEmpty(path))
@@ -176,7 +180,10 @@ namespace NetPro.Analysic
             }
             limitByIpError = _redisManager.Get<int>(keyError);
 
-            if (maxErrorLimit > 0 && limitByIpError > maxErrorLimit)
+            if (maxLimit > 0 && limitByIp >= maxLimit)
+                return Tuple.Create<bool, int, int>(false, limitByIp, limitByIpError);
+
+            if (maxErrorLimit > 0 && limitByIpError >= maxErrorLimit)
                 return Tuple.Create<bool, int, int>(false, limitByIp, limitByIpError);
 
             return Tuple.Create<bool, int, int>(true, limitByIp, limitByIpError);
@@ -213,52 +220,50 @@ namespace NetPro.Analysic
         /// 
         /// </summary>
         /// <param name="keySucceed"></param>
-        /// <param name="limitByIp"></param>
         /// <param name="keyError"></param>
-        /// <param name="limitByIpError"></param>
-        private void RecordRequest(string keySucceed = null, int limitByIp = 0, string keyError = null, int limitByIpError = 0)
+        /// <param name="hitDuration"></param>
+        private void RecordRequest(string keySucceed = null, string keyError = null, string hitDuration = "1d")
         {
-            var exchangedb = _redisManager.GetIDatabase();
-
-            List<Task<bool>> tasklist = new List<Task<bool>>();
-            IBatch batch = exchangedb.CreateBatch();
-
             if (!string.IsNullOrEmpty(keySucceed))
             {
-                keySucceed = $"{_redisCacheOption.DefaultCustomKey}{keySucceed}";
-                //成功
-                var expiredTime = RedisHelper.PTtl(keySucceed);
-                if (expiredTime <= 0)
+                if (!_redisManager.Exists(keySucceed))
                 {
-                    expiredTime = 60 * 60 * 24;
+                    _redisManager.StringIncrement(keySucceed, expiry: _ConvertToTimeSpan(hitDuration));
                 }
                 else
                 {
-                    expiredTime = expiredTime / 1000;
+                    _redisManager.StringIncrement(keySucceed);
                 }
-                var succeedIP = batch.StringSetAsync(keySucceed, limitByIp + 1, TimeSpan.FromSeconds(expiredTime));
-                tasklist.Add(succeedIP);
             }
             else
             {
-                keyError = $"{_redisCacheOption.DefaultCustomKey}{keyError}";
-                //失败
-                var keyErrorExpiredTime = RedisHelper.PTtl(keyError);
-                if (keyErrorExpiredTime <= 0)
+                if (!_redisManager.Exists(keyError))
                 {
-                    keyErrorExpiredTime = 60 * 60 * 24;
+                    _redisManager.StringIncrement(keyError, expiry: _ConvertToTimeSpan(hitDuration));
                 }
                 else
                 {
-                    keyErrorExpiredTime = keyErrorExpiredTime / 1000;
+                    _redisManager.StringIncrement(keyError);
                 }
-                var errorIp = batch.StringSetAsync(keyError, limitByIpError + 1, TimeSpan.FromSeconds(keyErrorExpiredTime));
-                tasklist.Add(errorIp);
             }
 
-            batch.Execute();
-            _iLogger.LogInformation("exchange驱动执行set");
-            Task.WhenAll(tasklist.ToArray());
+            TimeSpan _ConvertToTimeSpan(string timeSpan)
+            {
+                var l = timeSpan.Length - 1;
+                var value = timeSpan.Substring(0, l);
+                var type = timeSpan.Substring(l, 1);
+
+                switch (type)
+                {
+                    case "d": return TimeSpan.FromDays(double.Parse(value));
+                    case "h": return TimeSpan.FromHours(double.Parse(value));
+                    case "m": return TimeSpan.FromMinutes(double.Parse(value));
+                    case "s": return TimeSpan.FromSeconds(double.Parse(value));
+                    case "f": return TimeSpan.FromMilliseconds(double.Parse(value));
+                    case "z": return TimeSpan.FromTicks(long.Parse(value));
+                    default: return TimeSpan.FromDays(double.Parse(value));
+                }
+            }
         }
     }
 
@@ -276,9 +281,11 @@ namespace NetPro.Analysic
         public static IApplicationBuilder UseRequestAnalysis(
             this IApplicationBuilder builder)
         {
-            var responseCacheOption = builder.ApplicationServices.GetService(typeof(RequestAnalysisOption)) as RequestAnalysisOption;
-            if (responseCacheOption.Enabled)
+            var responseCacheOption = builder.ApplicationServices.GetService<RequestAnalysisOption>();
+            if (responseCacheOption?.Enabled ?? false)
             {
+                if (builder.ApplicationServices.GetService<IRedisManager>() == null || builder.ApplicationServices.GetService<IMemoryCache>() == null)
+                    return builder;
                 builder.UseMiddleware<RequestAnalysisMiddleware>();
             }
 
